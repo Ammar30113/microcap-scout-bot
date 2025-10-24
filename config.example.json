@@ -1,0 +1,5 @@
+{
+  "watchlist": ["AAPL", "TSLA"],
+  "rsi_threshold": 30,
+  "sentiment_threshold": 0.5
+}
