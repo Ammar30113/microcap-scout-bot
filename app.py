@@ -70,4 +70,12 @@ async def ai_signal(signal: AISignal, request: Request):
         time_in_force=TimeInForce.DAY
     )
     resp = client.submit_order(order)
+
+@app.get("/")
+async def root():
+    return {"message": "Microcap Scout Bot API is running"}
+
+@app.get("/products.json")
+async def products():
+    return {"products": []}
     return {"status": "executed", "symbol": signal.symbol, "action": action, "order_id": str(resp.id)}
