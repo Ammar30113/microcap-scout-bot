@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-alpaca-trade-api
+alpaca-py
+pandas
+requests
 pydantic
