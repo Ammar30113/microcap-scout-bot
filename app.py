@@ -20,7 +20,12 @@ class Alert(BaseModel):
     side: str
     price: float | None = None
 
-def penny_risk_checks(symbol: str, est_price: float):
+class AISignal(BaseModel):
+    symbol: str
+    action: str
+    qty: int | None = 1
+
+def penny_risk_checks(symbol: str, est_price: float | None):
     # Basic risk checks for penny stocks
     if est_price is None or est_price < 1.0:
         raise HTTPException(status_code=400, detail="Price too low for trade")
@@ -46,11 +51,23 @@ async def tradingview_webhook(alert: Alert, request: Request):
         side=side,
         time_in_force=TimeInForce.DAY
     )
-
     resp = client.submit_order(order)
     return {"ok": True, "order_id": str(resp.id)}
 
-# Example test:
-# curl -X POST https://microcap-scout-bot-nazesthetic.replit.app/tv \
-#   -H "Content-Type: application/json" \
-#   -d '{"event": "ENTRY", "symbol": "TSLA", "side": "BUY", "price": 19.8}'
+@app.post("/ai_signal")
+async def ai_signal(signal: AISignal, request: Request):
+    """Handle AI-generated trading signals."""
+    action = signal.action.upper()
+    qty = signal.qty or 1
+    if action not in ["BUY", "SELL"]:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+
+    order = MarketOrderRequest(
+        symbol=signal.symbol,
+        qty=qty,
+        side=side,
+        time_in_force=TimeInForce.DAY
+    )
+    resp = client.submit_order(order)
+    return {"status": "executed", "symbol": signal.symbol, "action": action, "order_id": str(resp.id)}
