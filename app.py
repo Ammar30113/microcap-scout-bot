@@ -6,8 +6,8 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # Read API keys from environment variables
-ALPACA_KEY = os.getenv("ALPACA_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET")
+ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
 # Initialize Alpaca client in paper mode
 client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
