@@ -1,53 +1,93 @@
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
 import os
+import time
+import requests
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 
-# --- Read API keys from Railway environment variables ---
-ALPACA_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY")
+# === Load environment variables ===
+ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+FINVIZ_TOKEN = os.getenv("FINVIZ_TOKEN")
+STOCKDATA_API_KEY = os.getenv("STOCKDATA_API_KEY")
 
-# Initialize Alpaca client (Paper trading mode)
-client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
+# === Alpaca client ===
+client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
-app = FastAPI()
+# === Step 1: Scan insider BUY trades on stocks $1–$10 ===
+def scan_stocks():
+    finviz_url = f"https://api.finviz.com/api/insider-trades?token={FINVIZ_TOKEN}"
+    try:
+        finviz_data = requests.get(finviz_url, timeout=10).json()
+    except Exception as e:
+        print(f"❌ Finviz API error: {e}")
+        return []
 
-# --- Define payload structure to match TradingView webhook ---
-class Alert(BaseModel):
-    event: str
-    symbol: str
-    side: str
-    price: float | None = None
+    qualifying = []
+    for entry in finviz_data.get("data", []):
+        if entry.get("transaction", "").lower() != "buy":
+            continue
+        ticker = entry.get("ticker")
+        if not ticker:
+            continue
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "timestamp": str(__import__("datetime").datetime.utcnow())}
+        try:
+            quote_url = f"https://api.stockdata.org/v1/data/quote?symbols={ticker}&api_token={STOCKDATA_API_KEY}"
+            quote_data = requests.get(quote_url, timeout=10).json()
+            price = float(quote_data["data"][0]["price"])
+        except Exception as e:
+            print(f"⚠️ Could not fetch price for {ticker}: {e}")
+            continue
 
-# --- TradingView webhook endpoint ---
-@app.post("/")
-async def handle_alert(alert: Alert, request: Request):
-    """Handle incoming TradingView webhook alerts and submit orders to Alpaca."""
-    print(f"📩 TradingView Webhook Received: {alert.dict()}")
+        if 1.0 <= price <= 10.0:
+            qualifying.append({"symbol": ticker, "price": price})
 
-    # Determine order side
-    side = OrderSide.BUY if alert.side.upper() == "BUY" else OrderSide.SELL
+    print(f"📊 Found {len(qualifying)} qualifying insider-buy stocks.")
+    return qualifying
 
-    # Create and submit a market order
-    order = MarketOrderRequest(
-        symbol=alert.symbol,
-        qty=100,
-        side=side,
-        time_in_force=TimeInForce.DAY
-    )
+# === Step 2: Execute bracket trades ===
+def place_bracket_order(symbol: str, price: float, qty: int = 10):
+    take_profit = round(price * 1.05, 2)
+    stop_loss = round(price * 0.98, 2)
 
     try:
-        resp = client.submit_order(order)
-        print(f"✅ Order placed: {alert.symbol} ({alert.side}) @ {alert.price}")
-        return {"status": "executed", "symbol": alert.symbol, "side": alert.side, "order_id": str(resp.id)}
+        order = client.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            type=OrderType.MARKET,
+            time_in_force=TimeInForce.DAY,
+            take_profit={"limit_price": take_profit},
+            stop_loss={"stop_price": stop_loss}
+        )
+        print(f"✅ {symbol}: Bought at ${price} | TP ${take_profit} | SL ${stop_loss}")
+        return order
     except Exception as e:
-        print(f"❌ Order failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Failed to place order for {symbol}: {e}")
+        return None
+
+# === Step 3: Auto-trade loop ===
+def auto_trade():
+    stocks = scan_stocks()
+    for stock in stocks:
+        symbol = stock["symbol"]
+        price = stock["price"]
+
+        # Optional: skip if position already open
+        positions = [p.symbol for p in client.get_all_positions()]
+        if symbol in positions:
+            print(f"🔁 Skipping {symbol} — position already open.")
+            continue
+
+        place_bracket_order(symbol, price)
+
+# === Main loop ===
+if __name__ == "__main__":
+    while True:
+        print("🚀 Running Microcap Scout AI — Insider Momentum Cycle")
+        auto_trade()
+        print("💤 Sleeping 15 minutes...\n")
+        time.sleep(900)
+
 
 
