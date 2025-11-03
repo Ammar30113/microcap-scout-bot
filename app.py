@@ -9,37 +9,43 @@ from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakePro
 from fastapi import FastAPI
 
 app = FastAPI()
-# === Load environment variables ===
-ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-FINVIZ_TOKEN = os.getenv("FINVIZ_TOKEN")
-STOCKDATA_API_KEY = os.getenv("STOCKDATA_API_KEY")
 
 _trading_client: Optional[TradingClient] = None
+_http_session = requests.Session()
+
+
+def _require_env(key: str) -> str:
+    value = os.getenv(key)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return value
 
 
 def get_trading_client() -> TradingClient:
     global _trading_client
     if _trading_client is None:
-        if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-            raise RuntimeError(
-                "Missing Alpaca API credentials. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY."
-            )
-        _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+        api_key = _require_env("APCA_API_KEY_ID")
+        api_secret = _require_env("APCA_API_SECRET_KEY")
+        _trading_client = TradingClient(api_key, api_secret, paper=True)
     return _trading_client
 
 # === Step 1: Scan insider BUY trades on stocks $1–$10 ===
 def scan_stocks():
-    if not FINVIZ_TOKEN:
+    finviz_token = os.getenv("FINVIZ_TOKEN")
+    stockdata_key = os.getenv("STOCKDATA_API_KEY")
+
+    if not finviz_token:
         print("⚠️ FINVIZ_TOKEN not set; skipping insider scan.")
         return []
-    if not STOCKDATA_API_KEY:
+    if not stockdata_key:
         print("⚠️ STOCKDATA_API_KEY not set; skipping insider scan.")
         return []
 
-    finviz_url = f"https://api.finviz.com/api/insider-trades?token={FINVIZ_TOKEN}"
+    finviz_url = f"https://api.finviz.com/api/insider-trades?token={finviz_token}"
     try:
-        finviz_data = requests.get(finviz_url, timeout=10).json()
+        finviz_response = _http_session.get(finviz_url, timeout=10)
+        finviz_response.raise_for_status()
+        finviz_data = finviz_response.json()
     except Exception as e:
         print(f"❌ Finviz API error: {e}")
         return []
@@ -53,9 +59,16 @@ def scan_stocks():
             continue
 
         try:
-            quote_url = f"https://api.stockdata.org/v1/data/quote?symbols={ticker}&api_token={STOCKDATA_API_KEY}"
-            quote_data = requests.get(quote_url, timeout=10).json()
-            price = float(quote_data["data"][0]["price"])
+            quote_url = (
+                f"https://api.stockdata.org/v1/data/quote?symbols={ticker}&api_token={stockdata_key}"
+            )
+            quote_response = _http_session.get(quote_url, timeout=10)
+            quote_response.raise_for_status()
+            quote_data = quote_response.json()
+            data = quote_data.get("data") or []
+            if not data:
+                raise ValueError("Empty price payload")
+            price = float(data[0]["price"])
         except Exception as e:
             print(f"⚠️ Could not fetch price for {ticker}: {e}")
             continue
@@ -119,4 +132,3 @@ if __name__ == "__main__":
         auto_trade()
         print("💤 Sleeping 15 minutes...\n")
         time.sleep(900)
-
