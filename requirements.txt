@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 requests
-alpaca-py
-pydantic
-ratelimit
+pandas
+yfinance
+alpaca-trade-api
+ta
 beautifulsoup4
