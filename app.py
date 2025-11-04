@@ -1,15 +1,13 @@
 import logging
 import os
 import time
-from collections import defaultdict
 from datetime import datetime, time as dt_time, timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import pytz
 from ratelimit import limits, sleep_and_retry
 
 import requests
-from bs4 import BeautifulSoup
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 from alpaca.trading.requests import (
@@ -18,9 +16,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 from fastapi import FastAPI, Query
-
-if TYPE_CHECKING:
-    import pandas as pd
+from finviz_scraper import fetch_insider_trades
 
 app = FastAPI()
 
@@ -47,154 +43,7 @@ STOCKDATA_API_KEY = os.getenv("STOCKDATA_API_KEY")
 CALLS_PER_SECOND = 2
 SECONDS_BETWEEN_CALLS = 1
 
-# Finviz has no JSON API, so we scrape the insider trading screener instead.
-FINVIZ_INSIDER_URL = "https://finviz.com/insidertrading.ashx?tc=1"
-FINVIZ_REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-    )
-}
-FINVIZ_DEFAULT_LIMIT = 100
-
-
-def _parse_float(value: Optional[str]) -> Optional[float]:
-    if value is None:
-        return None
-    cleaned = value.strip().replace("$", "").replace(",", "")
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def _parse_volume(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-    cleaned = value.strip().replace(",", "").upper()
-    if not cleaned:
-        return None
-    multiplier = 1
-    if cleaned.endswith("M"):
-        multiplier = 1_000_000
-        cleaned = cleaned[:-1]
-    elif cleaned.endswith("K"):
-        multiplier = 1_000
-        cleaned = cleaned[:-1]
-    try:
-        return int(float(cleaned) * multiplier)
-    except ValueError:
-        return None
-
-
-def _parse_percentage(value: Optional[str]) -> Optional[float]:
-    if value is None:
-        return None
-    cleaned = value.strip().replace("%", "").replace("+", "")
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def _extract_first(entry: Dict[str, Any], keys: List[str]) -> Optional[str]:
-    for key in keys:
-        value = entry.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return None
-
-
-def _summarize_trades(trades: List[Dict[str, Any]]) -> Optional[str]:
-    if not trades:
-        return None
-    buys = sum(
-        1 for trade in trades if str(trade.get("transaction", "")).lower() == "buy"
-    )
-    sells = sum(
-        1 for trade in trades if str(trade.get("transaction", "")).lower() == "sell"
-    )
-    latest = trades[0]
-    latest_date = latest.get("date") or "recent"
-    return f"{buys} buys / {sells} sells (latest {latest_date})"
-
-
-# Fetch raw HTML so we can scrape instead of calling a non-existent Finviz API.
-def _fetch_finviz_html(url: str, timeout: int = 10) -> Optional[str]:
-    try:
-        response = _http_session.get(
-            url,
-            headers=FINVIZ_REQUEST_HEADERS,
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
-        logger.warning("Finviz request error (%s): %s", url, exc)
-        return None
-
-    if response.status_code in (403, 404):
-        logger.warning(
-            "Finviz returned HTTP %s for %s; skipping scrape.",
-            response.status_code,
-            url,
-        )
-        return None
-
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        logger.warning("Finviz request for %s failed: %s", url, exc)
-        return None
-
-    return response.text
-
-
-# Parse the insider trading table from Finviz HTML to keep the existing strategy alive.
-def _scrape_finviz_insider_trades(limit: int = FINVIZ_DEFAULT_LIMIT) -> List[Dict[str, Any]]:
-    html = _fetch_finviz_html(FINVIZ_INSIDER_URL)
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", class_="body-table")
-    if table is None:
-        logger.warning("Unable to find insider trading table on Finviz page.")
-        return []
-
-    trades: List[Dict[str, Any]] = []
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
-        if not cells:
-            continue
-
-        # Header rows have bold text, skip them.
-        if cells[0].get_text(strip=True).lower() == "ticker":
-            continue
-
-        data = [cell.get_text(strip=True) for cell in cells]
-        if len(data) < 7:
-            continue
-
-        ticker = data[0].upper()
-        transaction = data[4]
-        if not ticker or not transaction:
-            continue
-
-        trade = {
-            "symbol": ticker,
-            "transaction": transaction,
-            "price": _parse_float(data[5]),
-            "date": data[3],
-        }
-        trades.append(trade)
-
-        if len(trades) >= limit:
-            break
-
-    return trades
+INSIDER_DEFAULT_LIMIT = 100
 
 
 @sleep_and_retry
@@ -223,6 +72,11 @@ def get_trading_client() -> TradingClient:
         api_secret = ALPACA_SECRET_KEY or _require_env("APCA_API_SECRET_KEY")
         _trading_client = TradingClient(api_key, api_secret, paper=True)
     return _trading_client
+
+
+def get_recent_insider_trades(limit: int = INSIDER_DEFAULT_LIMIT) -> List[Dict[str, Any]]:
+    """Shared helper so both the trading loop and APIs reuse the same Finviz scrape logic."""
+    return fetch_insider_trades(limit=limit, session=_http_session)
 
 
 def calculate_position_size(client: TradingClient, price: float, max_position_pct: float = 0.02) -> int:
@@ -294,7 +148,8 @@ def scan_stocks():
         return []
 
     # Scrape the insider trading page because Finviz does not expose a JSON API.
-    insider_trades = _scrape_finviz_insider_trades(limit=FINVIZ_DEFAULT_LIMIT)
+    # Reuse the same scrape the API serves so our trading loop and HTTP responses stay in sync.
+    insider_trades = get_recent_insider_trades(limit=INSIDER_DEFAULT_LIMIT)
     if not insider_trades:
         logger.info("No insider trades scraped from Finviz.")
         return []
@@ -304,7 +159,7 @@ def scan_stocks():
     for entry in insider_trades:
         if entry.get("transaction", "").lower() != "buy":
             continue
-        ticker = entry.get("symbol")
+        ticker = entry.get("ticker")
         if not ticker or ticker in seen_symbols:
             continue
         seen_symbols.add(ticker)
@@ -330,49 +185,6 @@ def scan_stocks():
 
     logger.info(f"Found {len(qualifying)} qualifying insider-buy stocks.")
     return qualifying
-
-
-def scan_finviz_insider_stocks(
-    return_dataframe: bool = False,
-    limit: int = FINVIZ_DEFAULT_LIMIT,
-) -> Union[List[Dict[str, Any]], "pd.DataFrame"]:
-    # Reuse the scraped insider trades so FastAPI can show the latest context.
-    trades = _scrape_finviz_insider_trades(limit=limit)
-    if not trades:
-        return _coerce_dataframe([], return_dataframe)
-
-    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for trade in trades:
-        grouped[trade["symbol"]].append(trade)
-
-    results: List[Dict[str, Any]] = []
-    for symbol, symbol_trades in grouped.items():
-        summary = _summarize_trades(symbol_trades)
-        price = next((t.get("price") for t in symbol_trades if t.get("price") is not None), None)
-        record = {
-            "symbol": symbol,
-            "price": price,
-            "avg_volume": None,
-            "insider_ownership": None,
-            "insider_activity": summary or "No recent insider activity",
-        }
-        results.append(record)
-
-    results.sort(key=lambda item: item["symbol"])
-    return _coerce_dataframe(results, return_dataframe)
-
-
-def _coerce_dataframe(
-    data: List[Dict[str, Any]], return_dataframe: bool
-) -> Union[List[Dict[str, Any]], "pd.DataFrame"]:
-    if not return_dataframe:
-        return data
-    try:
-        import pandas as pd  # type: ignore
-    except ImportError:
-        logger.warning("pandas is not available; falling back to JSON list.")
-        return data
-    return pd.DataFrame(data)
 
 
 # === Step 2: Execute bracket trades ===
@@ -436,18 +248,25 @@ def root_status():
 
 
 @app.get("/products.json")
-def products(insider: bool = Query(False, description="Return only insider-filtered stocks")):
+def products(insider: bool = Query(False, description="Return only raw insider trades")):
     try:
-        insider_stocks = scan_finviz_insider_stocks(return_dataframe=False)
+        insider_trades = get_recent_insider_trades(limit=INSIDER_DEFAULT_LIMIT)
     except Exception as exc:
-        logger.error("Failed to fetch insider stocks: %s", exc)
-        insider_stocks = []
+        logger.error("Failed to fetch insider trades: %s", exc)
+        insider_trades = []
 
     if insider:
-        return {"insider_stocks": insider_stocks}
+        return {"insider_trades": insider_trades}
 
     stocks = scan_stocks()
-    return {"stocks": stocks, "insider_stocks": insider_stocks}
+    return {"stocks": stocks, "insider_trades": insider_trades}
+
+
+@app.get("/insider-trades.json")
+def insider_trades(limit: int = Query(INSIDER_DEFAULT_LIMIT, ge=1, le=500)):
+    """Expose the raw insider trade scrape so clients can consume it directly."""
+    trades = get_recent_insider_trades(limit=limit)
+    return {"insider_trades": trades}
 
 
 # === Main loop ===
