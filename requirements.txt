@@ -4,3 +4,4 @@ requests
 alpaca-py
 pydantic
 ratelimit
+beautifulsoup4

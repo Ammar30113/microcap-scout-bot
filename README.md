@@ -6,11 +6,11 @@ An AI-driven tool for scouting micro cap stocks with penny stock characteris
 
 Micro cap stocks — companies with market capitalizations roughly between $50 million and $300 million — can offer outsized returns but also carry significant risk due to illiquidity, limited public information, and susceptibility to volatility ([Micro-Cap: Definition in Stock Investing, Risks Vs. Larger ...](https://www.investopedia.com/terms/m/microcapstock.asp#:~:text=Micro,What%20Is%20a%20Micro%20Cap)).  
 
-This bot focuses on a single momentum strategy: it scans for recent insider BUY filings via Finviz, filters for stocks trading between $1 and $10, then places a bracket order through the Alpaca paper trading API with a 5 % take-profit and 2 % stop-loss.  
+This bot focuses on a single momentum strategy: it scrapes Finviz’s insider trading screener for recent BUY filings, filters for stocks trading between $1 and $10, then places a bracket order through the Alpaca paper trading API with a 5 % take-profit and 2 % stop-loss.  
 
 ## Features  
 
-- **Insider Trade Scan:** Pulls the latest insider transactions from the Finviz API and filters for qualifying BUY trades.  
+- **Insider Trade Scan:** Scrapes the latest insider transactions from Finviz’s public screener and filters for qualifying BUY trades.  
 - **Price Validation:** Confirms the current quote via stockdata.org and enforces the $1–$10 price band.  
 - **Bracket Orders:** Submits Alpaca bracket market orders with configurable size, attaching both take-profit and stop-loss legs.  
 - **Position Guard:** Skips symbols that are already present in the Alpaca account’s open positions.  
@@ -21,7 +21,6 @@ This bot focuses on a single momentum strategy: it scans for recent insider BUY 
 2. Install dependencies via `pip install -r requirements.txt`.  
 3. Set the following environment variables (e.g. in `.env` or your process manager):  
    - `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` (Alpaca paper trading credentials)  
-   - `FINVIZ_TOKEN` (Finviz API token)  
    - `STOCKDATA_API_KEY` (stockdata.org API token)  
 4. Run `python app.py` for the polling loop, or `python main.py` to serve the FastAPI app.  
 
