@@ -3,6 +3,9 @@ import os
 import uvicorn
 
 from app import app
+from social_scanner import router as social_router
+
+app.include_router(social_router)
 
 __all__ = ["app"]
 
