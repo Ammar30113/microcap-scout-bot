@@ -11,7 +11,11 @@ from ratelimit import limits, sleep_and_retry
 import requests
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 from fastapi import FastAPI, Query
 
 if TYPE_CHECKING:
@@ -32,6 +36,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# === Load environment variables ===
+ALPACA_API_KEY = os.getenv("APCA_API_KEY_ID")
+ALPACA_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+FINVIZ_TOKEN = os.getenv("FINVIZ_TOKEN")
+STOCKDATA_API_KEY = os.getenv("STOCKDATA_API_KEY")
 
 # API rate limits
 CALLS_PER_SECOND = 2
@@ -180,8 +190,8 @@ def _require_env(key: str) -> str:
 def get_trading_client() -> TradingClient:
     global _trading_client
     if _trading_client is None:
-        api_key = _require_env("APCA_API_KEY_ID")
-        api_secret = _require_env("APCA_API_SECRET_KEY")
+        api_key = ALPACA_API_KEY or _require_env("APCA_API_KEY_ID")
+        api_secret = ALPACA_SECRET_KEY or _require_env("APCA_API_SECRET_KEY")
         _trading_client = TradingClient(api_key, api_secret, paper=True)
     return _trading_client
 
@@ -249,8 +259,8 @@ def scan_stocks():
         logger.info("Market is closed. Skipping scan.")
         return []
 
-    finviz_token = os.getenv("FINVIZ_TOKEN")
-    stockdata_key = os.getenv("STOCKDATA_API_KEY")
+    finviz_token = FINVIZ_TOKEN or os.getenv("FINVIZ_TOKEN")
+    stockdata_key = STOCKDATA_API_KEY or os.getenv("STOCKDATA_API_KEY")
 
     if not finviz_token or not stockdata_key:
         logger.error("Missing API keys")
@@ -297,7 +307,7 @@ def scan_finviz_insider_stocks(
     return_dataframe: bool = False,
     limit: int = FINVIZ_DEFAULT_LIMIT,
 ) -> Union[List[Dict[str, Any]], "pd.DataFrame"]:
-    token = os.getenv("FINVIZ_TOKEN")
+    token = FINVIZ_TOKEN or os.getenv("FINVIZ_TOKEN")
     if not token:
         logger.warning("FINVIZ_TOKEN is not configured; returning no insider stocks.")
         return _coerce_dataframe([], return_dataframe)
