@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-alpaca-py
-pandas
 requests
+alpaca-py
 pydantic
+ratelimit
