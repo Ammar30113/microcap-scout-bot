@@ -1,8 +1,8 @@
 import os
-import time
 import logging
+import time
 from typing import Optional
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import pytz
 from ratelimit import limits, sleep_and_retry
 
@@ -79,6 +79,38 @@ def is_market_hours() -> bool:
     if now.weekday() > 4:  # Saturday = 5, Sunday = 6
         return False
     return True
+
+
+def seconds_until_market_open(now: Optional[datetime] = None) -> int:
+    """Return seconds until the next market open from the current time."""
+    ny_tz = pytz.timezone('America/New_York')
+    market_open_time = dt_time(9, 30)
+    market_close_time = dt_time(16, 0)
+
+    if now is None:
+        now = datetime.now(ny_tz)
+    else:
+        now = now.astimezone(ny_tz)
+
+    # Market currently open
+    if (
+        now.weekday() < 5
+        and market_open_time <= now.time() < market_close_time
+    ):
+        return 0
+
+    # Before open on a trading day
+    if now.weekday() < 5 and now.time() < market_open_time:
+        next_open = ny_tz.localize(datetime.combine(now.date(), market_open_time))
+    else:
+        # Advance to the next trading day (Mon–Fri)
+        next_day = now + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        next_open = ny_tz.localize(datetime.combine(next_day.date(), market_open_time))
+
+    delta = next_open - now
+    return max(int(delta.total_seconds()), 0)
 
 
 # === Step 1: Scan insider BUY trades on stocks $1–$10 ===
@@ -161,7 +193,6 @@ def place_bracket_order(client: TradingClient, symbol: str, price: float, qty: O
 # === Step 3: Auto-trade loop ===
 def auto_trade():
     if not is_market_hours():
-        logger.info("Market is closed. Skipping trading cycle.")
         return
 
     stocks = scan_stocks()
@@ -191,6 +222,19 @@ if __name__ == "__main__":
     logger.info("Starting Microcap Scout AI — Insider Momentum Cycle")
     while True:
         try:
+            wait_seconds = seconds_until_market_open()
+            if wait_seconds > 0:
+                hours, remainder = divmod(wait_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                logger.info(
+                    "Market closed. Next open in %02dh:%02dm:%02ds — sleeping.",
+                    hours,
+                    minutes,
+                    seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+
             auto_trade()
             logger.info("Sleeping 15 minutes...")
             time.sleep(900)
