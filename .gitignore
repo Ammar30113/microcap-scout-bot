@@ -1,0 +1,6 @@
+# Prevent local virtualenvs from being deployed to Railway
+.venv/
+venv/
+
+# Python bytecode caches
+__pycache__/
