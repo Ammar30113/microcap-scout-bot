@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter, Retry
-from requests.exceptions import HTTPError, RetryError
+from requests.exceptions import HTTPError, RequestException, RetryError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +22,11 @@ FINVIZ_URL = "https://finviz.com/quote.ashx?t={symbol}"
 CHART_THROTTLE_SECONDS = 1.5
 CHART_COOLDOWN_SECONDS = 300
 _rate_limited_until = 0.0
+
+# Temporary cache so we do not hammer upstream providers repeatedly within a single run.
+_FUNDAMENTAL_CACHE: Dict[str, Dict] = {}
+_CACHE_TTL_SECONDS = 300
+_WARNED: set[tuple[str, str, str]] = set()
 
 retry_strategy = Retry(
     total=3,
@@ -38,10 +44,10 @@ FINVIZ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 class DataFetchError(RuntimeError):
-    pass
+    """Raised when upstream data is unavailable."""
 
 
-def is_rate_limited() -> bool:
+def _is_rate_limited() -> bool:
     return time.time() < _rate_limited_until
 
 
@@ -50,132 +56,159 @@ def _mark_rate_limited(multiplier: int = 1) -> None:
     _rate_limited_until = time.time() + CHART_COOLDOWN_SECONDS * multiplier
 
 
+def _log_warning(symbol: str, reason: str, source: str) -> None:
+    key = (symbol, reason, source)
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    LOGGER.warning(json.dumps({"symbol": symbol, "reason": reason, "source": source}))
+
+
 @retry(  # type: ignore
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
     retry=retry_if_exception_type(DataFetchError),
 )
-def _download_yfinance(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    if df.empty:
-        raise DataFetchError(f"Empty response for {symbol}")
-    return df
+def _fetch_yahoo(symbol: str) -> Dict:
+    if _is_rate_limited():
+        raise DataFetchError("Yahoo temporarily rate limited")
 
-
-def get_price_history(symbol: str, interval: str = "1h", period: str = "5d") -> Optional[pd.DataFrame]:
-    cooldown_multiplier = 1
-
-    for attempt in range(3):
-        if is_rate_limited():
-            sleep_for = max(0.0, _rate_limited_until - time.time())
-            LOGGER.info("Cooling off %.1fs before retrying %s", sleep_for, symbol)
-            time.sleep(min(sleep_for, CHART_COOLDOWN_SECONDS))
-
-        try:
-            df = _download_yfinance(symbol, interval, period)
-            return df.dropna()
-        except DataFetchError:
-            pass
-        except RetryError:
-            LOGGER.warning("Yahoo rate limit hit for %s (attempt %s/3)", symbol, attempt + 1)
-            _mark_rate_limited(cooldown_multiplier)
-            time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
-            cooldown_multiplier *= 2
-            continue
-        except HTTPError as exc:
-            if getattr(exc.response, "status_code", None) == 429:
-                LOGGER.warning("HTTP 429 for %s (attempt %s/3)", symbol, attempt + 1)
-                _mark_rate_limited(cooldown_multiplier)
-                time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
-                cooldown_multiplier *= 2
-                continue
-            LOGGER.warning("HTTP error for %s: %s", symbol, exc)
-            break
-        except Exception as exc:
-            LOGGER.warning("Retry %s/3 for %s failed: %s", attempt + 1, symbol, exc)
-            time.sleep(CHART_THROTTLE_SECONDS)
-
-    stockdata_key = os.getenv("STOCKDATA_API_KEY")
-    if stockdata_key:
-        try:
-            resp = SESSION.get(
-                STOCKDATA_BASE_URL,
-                params={"symbols": symbol, "api_token": stockdata_key},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
-            if data:
-                quote = data[0]
-                price = quote.get("price")
-                volume = quote.get("volume")
-                if price is not None:
-                    df = pd.DataFrame(
-                        {
-                            "Close": [float(price)],
-                            "Volume": [float(volume) if volume is not None else 0],
-                        }
-                    )
-                    return df
-        except Exception as exc:
-            LOGGER.warning("StockData fallback failed for %s: %s", symbol, exc)
-
-    info = _yfinance_snapshot(symbol)
-    if info is None:
-        return None
-    df = pd.DataFrame(
-        {
-            "Close": [info["price"]],
-            "Volume": [info.get("volume", 0.0)],
-        }
-    )
-    return df
-
-
-def _yfinance_snapshot(symbol: str) -> Optional[dict]:
     try:
         ticker = yf.Ticker(symbol)
         info = getattr(ticker, "fast_info", None) or {}
-        if not info:
-            return None
+        price = info.get("last_price") or info.get("last_price_usd") or info.get("previous_close")
         market_cap = info.get("market_cap")
-        price = (
-            info.get("last_price")
-            or info.get("last_price_usd")
-            or info.get("previous_close")
-        )
-        volume = info.get("last_volume") or info.get("volume")
-        if market_cap is None or price is None:
-            return None
-        snapshot = {
-            "market_cap": float(market_cap),
+        pe_ratio = info.get("pe_ratio") or info.get("trailing_pe")
+        if price is None or market_cap is None:
+            raise DataFetchError("Incomplete Yahoo fundamentals")
+        volume = info.get("last_volume") or info.get("volume") or 0.0
+        return {
+            "symbol": symbol,
             "price": float(price),
-            "volume": float(volume) if volume is not None else 0.0,
+            "market_cap": float(market_cap),
+            "pe_ratio": float(pe_ratio) if pe_ratio else None,
+            "volume": float(volume),
+            "source": "yahoo",
         }
-        return snapshot
+    except RetryError as exc:  # pragma: no cover - raised by tenacity wrapper
+        _mark_rate_limited()
+        raise DataFetchError(str(exc))
+    except HTTPError as exc:
+        if getattr(exc.response, "status_code", None) == 429:
+            _mark_rate_limited()
+        raise DataFetchError(f"HTTP error: {exc}")
     except Exception as exc:
-        LOGGER.warning("yfinance snapshot failed for %s: %s", symbol, exc)
+        raise DataFetchError(str(exc))
+
+
+def _fetch_finviz(symbol: str) -> Optional[Dict]:
+    try:
+        html = SESSION.get(FINVIZ_URL.format(symbol=symbol), headers=FINVIZ_HEADERS, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+        cells = soup.select("table.snapshot-table2 td")
+        if not cells:
+            return None
+        data = {cells[i].get_text(strip=True): cells[i + 1].get_text(strip=True) for i in range(0, len(cells) - 1, 2)}
+        price_text = data.get("Price")
+        pe_text = data.get("P/E")
+        mcap_text = data.get("Market Cap")
+        volume_text = data.get("Volume")
+
+        if not price_text or not mcap_text:
+            return None
+
+        def _parse_float(value: str) -> Optional[float]:
+            value = value.replace(",", "")
+            multipliers = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+            suffix = value[-1]
+            if suffix in multipliers:
+                return float(value[:-1]) * multipliers[suffix]
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        price = _parse_float(price_text)
+        mcap = _parse_float(mcap_text)
+        pe_ratio = _parse_float(pe_text) if pe_text else None
+        volume = _parse_float(volume_text) if volume_text else 0.0
+
+        if price is None or mcap is None:
+            return None
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "market_cap": mcap,
+            "pe_ratio": pe_ratio,
+            "volume": volume,
+            "source": "finviz",
+        }
+    except Exception as exc:
+        _log_warning(symbol, f"finviz_error:{exc}", "finviz")
         return None
 
 
-def get_quote_snapshot(symbol: str) -> Optional[dict]:
-    stockdata_key = os.getenv("STOCKDATA_API_KEY")
-    if stockdata_key:
-        try:
-            resp = SESSION.get(
-                STOCKDATA_BASE_URL,
-                params={"symbols": symbol, "api_token": stockdata_key},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
-            if data:
-                return data[0]
-        except Exception as exc:
-            LOGGER.warning("StockData snapshot failed for %s: %s", symbol, exc)
+def _fetch_stockdata(symbol: str) -> Optional[Dict]:
+    api_key = os.getenv("STOCKDATA_API_KEY")
+    if not api_key:
+        return None
+    try:
+        resp = SESSION.get(
+            STOCKDATA_BASE_URL,
+            params={"symbols": symbol, "api_token": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return None
+        quote = data[0]
+        price = quote.get("price")
+        market_cap = quote.get("market_cap") or quote.get("marketCap")
+        pe_ratio = quote.get("pe_ratio") or quote.get("pe")
+        volume = quote.get("volume")
+        if price is None or market_cap is None:
+            return None
+        return {
+            "symbol": symbol,
+            "price": float(price),
+            "market_cap": float(market_cap),
+            "pe_ratio": float(pe_ratio) if pe_ratio else None,
+            "volume": float(volume) if volume is not None else 0.0,
+            "source": "stockdata",
+        }
+    except RequestException as exc:
+        _log_warning(symbol, f"stockdata_error:{exc}", "stockdata")
+        return None
 
-    return _yfinance_snapshot(symbol)
+
+def fetch_fundamentals(symbol: str) -> Optional[Dict]:
+    cached = _FUNDAMENTAL_CACHE.get(symbol)
+    if cached and time.time() - cached["timestamp"] < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    try:
+        yahoo_data = _fetch_yahoo(symbol)
+        if yahoo_data:
+            _FUNDAMENTAL_CACHE[symbol] = {"data": yahoo_data, "timestamp": time.time()}
+            return yahoo_data
+    except DataFetchError as exc:
+        _log_warning(symbol, f"yahoo_failure:{exc}", "yahoo")
+
+    finviz_data = _fetch_finviz(symbol)
+    if finviz_data:
+        _FUNDAMENTAL_CACHE[symbol] = {"data": finviz_data, "timestamp": time.time()}
+        return finviz_data
+
+    stockdata = _fetch_stockdata(symbol)
+    if stockdata:
+        _FUNDAMENTAL_CACHE[symbol] = {"data": stockdata, "timestamp": time.time()}
+        return stockdata
+
+    _log_warning(symbol, "missing fundamentals", "all")
+    return None
 
 
 def get_sentiment(symbol: str) -> str:
@@ -189,5 +222,5 @@ def get_sentiment(symbol: str) -> str:
             return "Negative"
         return "Neutral"
     except Exception as exc:
-        LOGGER.warning("Finviz sentiment failed for %s: %s", symbol, exc)
+        _log_warning(symbol, f"sentiment_error:{exc}", "finviz")
         return "Neutral"
