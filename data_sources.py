@@ -56,7 +56,7 @@ def _mark_rate_limited(multiplier: int = 1) -> None:
     wait=wait_exponential(multiplier=1, min=1, max=8),
     retry=retry_if_exception_type(DataFetchError),
 )
-def _download_yfinance(symbol: str, period: str, interval: str) -> pd.DataFrame:
+def _download_yfinance(symbol: str, interval: str, period: str) -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     if df.empty:
         raise DataFetchError(f"Empty response for {symbol}")
@@ -64,17 +64,37 @@ def _download_yfinance(symbol: str, period: str, interval: str) -> pd.DataFrame:
 
 
 def get_price_history(symbol: str, interval: str = "1h", period: str = "5d") -> Optional[pd.DataFrame]:
-    global _rate_limited_until
-    if is_rate_limited():
-        LOGGER.info("Skipping Yahoo fetch for %s during cooldown", symbol)
-        return None
+    cooldown_multiplier = 1
 
-    try:
-        df = _download_yfinance(symbol, period, interval)
-        return df.dropna()
-    except Exception as exc:
-        LOGGER.warning("Yahoo Finance failed for %s: %s", symbol, exc)
-        _mark_rate_limited()
+    for attempt in range(3):
+        if is_rate_limited():
+            sleep_for = max(0.0, _rate_limited_until - time.time())
+            LOGGER.info("Cooling off %.1fs before retrying %s", sleep_for, symbol)
+            time.sleep(min(sleep_for, CHART_COOLDOWN_SECONDS))
+
+        try:
+            df = _download_yfinance(symbol, interval, period)
+            return df.dropna()
+        except DataFetchError:
+            pass
+        except RetryError:
+            LOGGER.warning("Yahoo rate limit hit for %s (attempt %s/3)", symbol, attempt + 1)
+            _mark_rate_limited(cooldown_multiplier)
+            time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
+            cooldown_multiplier *= 2
+            continue
+        except HTTPError as exc:
+            if getattr(exc.response, "status_code", None) == 429:
+                LOGGER.warning("HTTP 429 for %s (attempt %s/3)", symbol, attempt + 1)
+                _mark_rate_limited(cooldown_multiplier)
+                time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
+                cooldown_multiplier *= 2
+                continue
+            LOGGER.warning("HTTP error for %s: %s", symbol, exc)
+            break
+        except Exception as exc:
+            LOGGER.warning("Retry %s/3 for %s failed: %s", attempt + 1, symbol, exc)
+            time.sleep(CHART_THROTTLE_SECONDS)
 
     stockdata_key = os.getenv("STOCKDATA_API_KEY")
     if not stockdata_key:
@@ -140,4 +160,3 @@ def get_sentiment(symbol: str) -> str:
     except Exception as exc:
         LOGGER.warning("Finviz sentiment failed for %s: %s", symbol, exc)
         return "Neutral"
-*** End Patch
