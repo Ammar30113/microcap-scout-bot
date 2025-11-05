@@ -97,34 +97,40 @@ def get_price_history(symbol: str, interval: str = "1h", period: str = "5d") -> 
             time.sleep(CHART_THROTTLE_SECONDS)
 
     stockdata_key = os.getenv("STOCKDATA_API_KEY")
-    if not stockdata_key:
-        return None
+    if stockdata_key:
+        try:
+            resp = SESSION.get(
+                STOCKDATA_BASE_URL,
+                params={"symbols": symbol, "api_token": stockdata_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if data:
+                quote = data[0]
+                price = quote.get("price")
+                volume = quote.get("volume")
+                if price is not None:
+                    df = pd.DataFrame(
+                        {
+                            "Close": [float(price)],
+                            "Volume": [float(volume) if volume is not None else 0],
+                        }
+                    )
+                    return df
+        except Exception as exc:
+            LOGGER.warning("StockData fallback failed for %s: %s", symbol, exc)
 
-    try:
-        resp = SESSION.get(
-            STOCKDATA_BASE_URL,
-            params={"symbols": symbol, "api_token": stockdata_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if not data:
-            return None
-        quote = data[0]
-        price = quote.get("price")
-        volume = quote.get("volume")
-        if price is None:
-            return None
-        df = pd.DataFrame(
-            {
-                "Close": [float(price)],
-                "Volume": [float(volume) if volume is not None else 0],
-            }
-        )
-        return df
-    except Exception as exc:
-        LOGGER.warning("StockData fallback failed for %s: %s", symbol, exc)
+    info = _yfinance_snapshot(symbol)
+    if info is None:
         return None
+    df = pd.DataFrame(
+        {
+            "Close": [info["price"]],
+            "Volume": [info.get("volume", 0.0)],
+        }
+    )
+    return df
 
 
 def _yfinance_snapshot(symbol: str) -> Optional[dict]:
@@ -169,7 +175,6 @@ def get_quote_snapshot(symbol: str) -> Optional[dict]:
         except Exception as exc:
             LOGGER.warning("StockData snapshot failed for %s: %s", symbol, exc)
 
-    # Fallback to yfinance fast_info so we still have usable fundamentals.
     return _yfinance_snapshot(symbol)
 
 
