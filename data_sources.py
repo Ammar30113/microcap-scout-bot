@@ -127,24 +127,50 @@ def get_price_history(symbol: str, interval: str = "1h", period: str = "5d") -> 
         return None
 
 
+def _yfinance_snapshot(symbol: str) -> Optional[dict]:
+    try:
+        ticker = yf.Ticker(symbol)
+        info = getattr(ticker, "fast_info", None) or {}
+        if not info:
+            return None
+        market_cap = info.get("market_cap")
+        price = (
+            info.get("last_price")
+            or info.get("last_price_usd")
+            or info.get("previous_close")
+        )
+        volume = info.get("last_volume") or info.get("volume")
+        if market_cap is None or price is None:
+            return None
+        snapshot = {
+            "market_cap": float(market_cap),
+            "price": float(price),
+            "volume": float(volume) if volume is not None else 0.0,
+        }
+        return snapshot
+    except Exception as exc:
+        LOGGER.warning("yfinance snapshot failed for %s: %s", symbol, exc)
+        return None
+
+
 def get_quote_snapshot(symbol: str) -> Optional[dict]:
     stockdata_key = os.getenv("STOCKDATA_API_KEY")
-    if not stockdata_key:
-        return None
-    try:
-        resp = SESSION.get(
-            STOCKDATA_BASE_URL,
-            params={"symbols": symbol, "api_token": stockdata_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if not data:
-            return None
-        return data[0]
-    except Exception as exc:
-        LOGGER.warning("Quote snapshot failed for %s: %s", symbol, exc)
-        return None
+    if stockdata_key:
+        try:
+            resp = SESSION.get(
+                STOCKDATA_BASE_URL,
+                params={"symbols": symbol, "api_token": stockdata_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            if data:
+                return data[0]
+        except Exception as exc:
+            LOGGER.warning("StockData snapshot failed for %s: %s", symbol, exc)
+
+    # Fallback to yfinance fast_info so we still have usable fundamentals.
+    return _yfinance_snapshot(symbol)
 
 
 def get_sentiment(symbol: str) -> str:
