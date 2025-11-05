@@ -25,6 +25,7 @@ _rate_limited_until = 0.0
 
 # Temporary cache so we do not hammer upstream providers repeatedly within a single run.
 _FUNDAMENTAL_CACHE: Dict[str, Dict] = {}
+_HISTORY_CACHE: Dict[str, Dict] = {}
 _CACHE_TTL_SECONDS = 300
 _WARNED: set[tuple[str, str, str]] = set()
 
@@ -224,3 +225,54 @@ def get_sentiment(symbol: str) -> str:
     except Exception as exc:
         _log_warning(symbol, f"sentiment_error:{exc}", "finviz")
         return "Neutral"
+
+
+def get_price_history(symbol: str, interval: str = "1h", period: str = "5d") -> Optional[pd.DataFrame]:
+    cached = _HISTORY_CACHE.get(symbol)
+    now = time.time()
+    if cached and now - cached["timestamp"] < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    cooldown_multiplier = 1
+
+    for attempt in range(3):
+        if is_rate_limited():
+            sleep_for = max(0.0, _rate_limited_until - time.time())
+            LOGGER.info("Cooling off %.1fs before retrying %s", sleep_for, symbol)
+            time.sleep(min(sleep_for, CHART_COOLDOWN_SECONDS))
+
+        try:
+            df = _download_yfinance(symbol, interval, period)
+            df = df.dropna()
+            if not df.empty:
+                _HISTORY_CACHE[symbol] = {"data": df, "timestamp": now}
+                return df
+        except DataFetchError:
+            pass
+        except RetryError:
+            LOGGER.warning("Yahoo rate limit hit for %s (attempt %s/3)", symbol, attempt + 1)
+            _mark_rate_limited(cooldown_multiplier)
+            time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
+            cooldown_multiplier *= 2
+            continue
+        except HTTPError as exc:
+            if getattr(exc.response, "status_code", None) == 429:
+                LOGGER.warning("HTTP 429 for %s (attempt %s/3)", symbol, attempt + 1)
+                _mark_rate_limited(cooldown_multiplier)
+                time.sleep((attempt + 1) * CHART_THROTTLE_SECONDS)
+                cooldown_multiplier *= 2
+                continue
+            LOGGER.warning("HTTP error for %s: %s", symbol, exc)
+            break
+        except Exception as exc:
+            LOGGER.warning("Retry %s/3 for %s failed: %s", attempt + 1, symbol, exc)
+            time.sleep(CHART_THROTTLE_SECONDS)
+
+    fundamentals = fetch_fundamentals(symbol)
+    if fundamentals and fundamentals.get("price"):
+        price = fundamentals["price"]
+        df = pd.DataFrame({"Close": [price], "Volume": [fundamentals.get("volume", 0.0)]})
+        _HISTORY_CACHE[symbol] = {"data": df, "timestamp": now}
+        return df
+
+    return None
