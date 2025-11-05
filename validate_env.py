@@ -16,10 +16,16 @@ REQUIRED_PACKAGES = [
     "python_dotenv",
 ]
 
+MODULE_ALIASES = {
+    "python_dotenv": "dotenv",
+}
+
 missing = []
 for pkg in REQUIRED_PACKAGES:
+    module_name = pkg.replace("-", "_")
+    module_name = MODULE_ALIASES.get(module_name, module_name)
     try:
-        importlib.import_module(pkg.replace("-", "_"))
+        importlib.import_module(module_name)
     except ImportError:
         missing.append(pkg)
 
