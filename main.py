@@ -1,23 +1,18 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-from datetime import datetime
 from typing import List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, Query, Response
 
-from data_sources import (
-    get_price_history,
-    get_quote_snapshot,
-    get_sentiment,
-    is_rate_limited,
-)
+from data_sources import fetch_fundamentals, get_price_history, get_sentiment, is_rate_limited
 from trade_engine import TradeEngine
 
-app = FastAPI(title="Microcap Scout v2", version="3.1.0")
+app = FastAPI(title="Microcap Scout v2", version="3.2.0")
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
@@ -64,8 +59,7 @@ def _compute_indicators(close_series: pd.Series) -> dict:
 
     if closes.size < 30:
         closes = pd.concat(
-            [closes, pd.Series([closes.iloc[-1]] * (30 - closes.size))],
-            ignore_index=True,
+            [closes, pd.Series([closes.iloc[-1]] * (30 - closes.size))], ignore_index=True
         )
 
     ema9 = closes.ewm(span=9, adjust=False).mean().iloc[-1]
@@ -94,32 +88,24 @@ def analyze(symbols: List[str]) -> List[dict]:
 
     for idx, symbol in enumerate(symbols):
         if is_rate_limited():
-            LOGGER.warning("Global rate limit active; stopping scan early")
+            LOGGER.warning("Rate limit active; stopping scan early")
             break
 
         if SYMBOL_DELAY_SECONDS > 0 and idx != 0:
             time.sleep(SYMBOL_DELAY_SECONDS)
 
-        fundamentals = get_quote_snapshot(symbol)
+        fundamentals = fetch_fundamentals(symbol)
         if not fundamentals:
-            LOGGER.warning("Skipping %s – missing fundamentals", symbol)
+            LOGGER.warning(json.dumps({"symbol": symbol, "reason": "missing fundamentals"}))
             continue
 
-        market_cap = fundamentals.get("market_cap") or fundamentals.get("marketCap")
-        volume = fundamentals.get("volume")
-        price = (
-            fundamentals.get("price")
-            or fundamentals.get("last_price")
-            or fundamentals.get("last_price_usd")
-        )
+        price = fundamentals.get("price")
+        market_cap = fundamentals.get("market_cap")
+        volume = fundamentals.get("volume", 0)
 
-        if market_cap is None or volume is None or price is None:
-            LOGGER.warning("Skipping %s – incomplete fundamentals", symbol)
+        if price is None or market_cap is None:
+            LOGGER.warning(json.dumps({"symbol": symbol, "reason": "incomplete fundamentals"}))
             continue
-
-        market_cap = float(market_cap)
-        volume = float(volume)
-        price = float(price)
 
         if market_cap > 500_000_000 or volume < 300_000:
             continue
@@ -127,11 +113,8 @@ def analyze(symbols: List[str]) -> List[dict]:
         closes = cached_history(symbol)
         synthetic_history = False
         if closes is None:
-            if price <= 0:
-                continue
             synthetic_history = True
             closes = pd.Series([price] * 30)
-            LOGGER.info("Using synthetic history for %s due to rate limit", symbol)
 
         indicators = _compute_indicators(closes)
         trend = indicators["trend"]
@@ -159,6 +142,7 @@ def analyze(symbols: List[str]) -> List[dict]:
                 "sentiment": sentiment,
                 "action": action,
                 "synthetic_history": synthetic_history,
+                "fundamentals_source": fundamentals.get("source"),
                 "trade": trade_info,
             }
         )
@@ -215,12 +199,8 @@ def scan(tickers: Optional[str] = Query(None, description="Comma separated ticke
 
 @app.get("/trade")
 def trade(symbol: str, action: str = "buy"):
-    closes = cached_history(symbol)
-    price = float(closes.iloc[-1]) if closes is not None and not closes.empty else None
-    if price is None:
-        snapshot = get_quote_snapshot(symbol)
-        if snapshot and snapshot.get("price"):
-            price = float(snapshot["price"])
+    fundamentals = fetch_fundamentals(symbol)
+    price = fundamentals.get("price") if fundamentals else None
     if price is None:
         return {"error": "Price unavailable"}
     result = engine.attempt_trade(symbol, price)
