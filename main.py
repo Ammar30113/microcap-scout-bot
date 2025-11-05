@@ -5,6 +5,7 @@ import time
 
 import pandas as pd
 import requests
+from requests.exceptions import HTTPError, RetryError
 import yfinance as yf
 from alpaca_trade_api import REST
 from fastapi import FastAPI, Query, Response
@@ -79,23 +80,40 @@ def _fetch_chart(symbol: str) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
     return df.dropna(subset=["Close"]).sort_index()
 
+
 def safe_download(symbol: str, retries: int = 3, delay: int = 2) -> pd.DataFrame:
     for attempt in range(retries):
         try:
             cached = get_cached(symbol)
             if cached is not None:
                 return cached
+
             df = _fetch_chart(symbol)
             if df.empty:
                 df = yf.download(symbol, period="5d", interval="1h", progress=False)
+
             if not df.empty:
                 set_cache(symbol, df)
                 return df
+
+        except RetryError as exc:
+            logging.warning(f"Yahoo rate limit hit for {symbol} (attempt {attempt + 1}/{retries})")
+            time.sleep(delay * (attempt + 1))
+            continue
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 429:
+                logging.warning(f"HTTP 429 for {symbol} (attempt {attempt + 1}/{retries})")
+                time.sleep(delay * (attempt + 1))
+                continue
+            logging.warning(f"HTTP error for {symbol}: {exc}")
+            break
         except Exception as exc:
             logging.warning(f"Retry {attempt + 1}/{retries} for {symbol}: {exc}")
             time.sleep(delay)
-    return pd.DataFrame()
 
+    logging.info(f"Skipping {symbol} after repeated download failures")
+    return pd.DataFrame()
 
 def get_sentiment(symbol: str) -> str:
     try:
