@@ -14,12 +14,18 @@ from ta.trend import EMAIndicator
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 cache = {}
 CACHE_TTL = 300  # seconds
 DEFAULT_TICKERS = ["CEI", "BBIG", "COSM", "GNS", "SOBR"]
 
-retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=("GET", "HEAD"),
+)
 session = requests.Session()
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
@@ -37,13 +43,51 @@ def set_cache(symbol: str, df: pd.DataFrame) -> None:
     cache[symbol] = {"df": df, "timestamp": time.time()}
 
 
+
+
+def _fetch_chart(symbol: str) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "interval": "1h",
+        "range": "5d",
+        "includePrePost": "false",
+        "events": "div,split",
+    }
+
+    response = session.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+
+    result_set = payload.get("chart", {}).get("result") or []
+    if not result_set:
+        return pd.DataFrame()
+
+    result = result_set[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators", {}).get("quote", [{}])[0]
+    if not timestamps or not indicators:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(indicators, index=pd.to_datetime(timestamps, unit="s"))
+    rename_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    df = df.rename(columns=rename_map)
+    return df.dropna(subset=["Close"]).sort_index()
+
 def safe_download(symbol: str, retries: int = 3, delay: int = 2) -> pd.DataFrame:
     for attempt in range(retries):
         try:
             cached = get_cached(symbol)
             if cached is not None:
                 return cached
-            df = yf.download(symbol, period="5d", interval="1h", progress=False)
+            df = _fetch_chart(symbol)
+            if df.empty:
+                df = yf.download(symbol, period="5d", interval="1h", progress=False)
             if not df.empty:
                 set_cache(symbol, df)
                 return df
