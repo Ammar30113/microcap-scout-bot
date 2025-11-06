@@ -141,11 +141,22 @@ function insert_comment(\PDO $pdo, int $messageId, string $nickname, string $bod
     $statement = $pdo->prepare(
         'INSERT INTO comments (message_id, nickname, body) VALUES (:message_id, :nickname, :body)'
     );
-    $statement->execute([
-        ':message_id' => $messageId,
-        ':nickname' => $nickname,
-        ':body' => $body,
-    ]);
+
+    try {
+        $statement->execute([
+            ':message_id' => $messageId,
+            ':nickname' => $nickname,
+            ':body' => $body,
+        ]);
+    } catch (\PDOException $exception) {
+        $errorCode = $exception->errorInfo[1] ?? null;
+
+        if ((string) $exception->getCode() === '23000' && (int) $errorCode === 1452) {
+            throw new \InvalidArgumentException('Unable to find the selected message for commenting.', 0, $exception);
+        }
+
+        throw new \RuntimeException('Failed to save comment.', 0, $exception);
+    }
 
     $commentId = (int) $pdo->lastInsertId();
 
