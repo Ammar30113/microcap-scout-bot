@@ -81,12 +81,14 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
             ? createdAt.toLocaleString()
             : comment.created_at || '';
 
+        const escapedBody = escapeHtml(comment.body ?? '').replace(/\n/g, '<br>');
+
         wrapper.innerHTML = `
             <p class="comment__meta">
                 <span class="comment__nickname">${escapeHtml(comment.nickname ?? 'Anonymous')}</span>
                 <time class="comment__timestamp" datetime="${escapeHtml(comment.created_at ?? '')}">${escapeHtml(timestamp)}</time>
             </p>
-            <p class="comment__body">${escapeHtml(comment.body ?? '')}</p>
+            <p class="comment__body">${escapedBody}</p>
         `;
 
         return wrapper;
