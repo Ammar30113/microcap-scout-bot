@@ -2,6 +2,10 @@ fastapi==0.115.0
 uvicorn==0.32.0
 requests==2.32.3
 pandas==2.2.3
+yfinance==0.2.40
+ta==0.11.0
+alpaca-trade-api==3.2.0
+fastapi-utils==0.8.0
 yfinance==0.2.52
 finvizlite==0.1.2
 stockstats==0.5.2
