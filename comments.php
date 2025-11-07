@@ -13,10 +13,25 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-$payload = json_decode(file_get_contents('php://input'), true);
+$rawPayload = file_get_contents('php://input');
+
+try {
+    $payload = json_decode($rawPayload, true, 512, JSON_THROW_ON_ERROR);
+} catch (\JsonException $exception) {
+    http_response_code(400);
+    echo json_encode([
+        'error' => 'Invalid JSON payload.',
+        'csrfToken' => rotate_csrf_token(),
+    ]);
+    exit;
+}
+
 if (!is_array($payload)) {
     http_response_code(400);
-    echo json_encode(['error' => 'Invalid JSON payload.']);
+    echo json_encode([
+        'error' => 'Invalid JSON payload.',
+        'csrfToken' => rotate_csrf_token(),
+    ]);
     exit;
 }
 

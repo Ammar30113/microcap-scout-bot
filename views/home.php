@@ -20,10 +20,10 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
             </header>
             <p class="message__body"><?= nl2br(htmlspecialchars((string) ($message['body'] ?? ''), ENT_QUOTES, 'UTF-8')) ?></p>
 
-            <section class="comments" data-comments>
+            <section class="comments" data-comments aria-live="polite" aria-atomic="false">
                 <?php $comments = $message['comments'] ?? []; ?>
                 <?php if ($comments === []): ?>
-                    <p class="comments__empty" data-empty-state>Be the first to comment.</p>
+                    <p class="comments__empty" data-empty-state role="status">Be the first to comment.</p>
                 <?php else: ?>
                     <?php foreach ($comments as $comment): ?>
                         <div class="comment" data-comment-id="<?= htmlspecialchars((string) $comment['id'], ENT_QUOTES, 'UTF-8') ?>">
@@ -100,6 +100,7 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
         const bodyField = form.querySelector('textarea[name="body"]');
         const csrfField = form.querySelector('input[name="csrf_token"]');
         const errorField = form.querySelector('[data-comment-error]');
+        const submitButton = form.querySelector('button[type="submit"], input[type="submit"]');
 
         const payload = {
             message_id: Number.parseInt(messageId, 10),
@@ -108,10 +109,37 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
             csrf_token: csrfField.value,
         };
 
+        if (payload.nickname.length === 0) {
+            errorField.textContent = 'Nickname is required.';
+            errorField.hidden = false;
+            return;
+        }
+
+        if (payload.nickname.length > 64) {
+            errorField.textContent = 'Nicknames must be 64 characters or fewer.';
+            errorField.hidden = false;
+            return;
+        }
+
+        if (payload.body.length === 0) {
+            errorField.textContent = 'Comment body is required.';
+            errorField.hidden = false;
+            return;
+        }
+
         if (payload.body.length > 240) {
             errorField.textContent = 'Comments must be 240 characters or fewer.';
             errorField.hidden = false;
             return;
+        }
+
+        form.dataset.submitting = 'true';
+        errorField.hidden = true;
+        errorField.textContent = '';
+
+        if (submitButton) {
+            submitButton.disabled = true;
+            submitButton.setAttribute('aria-busy', 'true');
         }
 
         try {
@@ -124,7 +152,13 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
                 body: JSON.stringify(payload),
             });
 
-            const data = await response.json();
+            let data;
+            try {
+                data = await response.json();
+            } catch (parseError) {
+                throw new Error('Failed to parse server response.');
+            }
+
             if (data.csrfToken) {
                 csrfField.value = data.csrfToken;
             }
@@ -133,8 +167,9 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
                 throw new Error(data.error || 'Failed to post comment.');
             }
 
-            errorField.hidden = true;
-            errorField.textContent = '';
+            if (!data.comment || typeof data.comment !== 'object') {
+                throw new Error('Server did not return the created comment.');
+            }
 
             const commentsContainer = form.parentElement.querySelector('[data-comments]');
             const emptyState = commentsContainer.querySelector('[data-empty-state]');
@@ -146,8 +181,15 @@ $messages = isset($messages) && is_iterable($messages) ? $messages : [];
             commentsContainer.appendChild(commentElement);
             bodyField.value = '';
         } catch (error) {
-            errorField.textContent = error.message;
+            const message = error instanceof Error ? error.message : 'Failed to post comment.';
+            errorField.textContent = message;
             errorField.hidden = false;
+        } finally {
+            if (submitButton) {
+                submitButton.disabled = false;
+                submitButton.removeAttribute('aria-busy');
+            }
+            delete form.dataset.submitting;
         }
     }
 
