@@ -1,3 +1,5 @@
+.venv
+venv/
 # Prevent local virtualenvs from being deployed to Railway
 .venv/
 venv/

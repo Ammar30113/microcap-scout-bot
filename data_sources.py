@@ -18,6 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 STOCKDATA_BASE_URL = "https://api.stockdata.org/v1/data/quote"
 FINVIZ_URL = "https://finviz.com/quote.ashx?t={symbol}"
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 CHART_THROTTLE_SECONDS = 1.5
 CHART_COOLDOWN_SECONDS = 300
@@ -57,6 +58,11 @@ def _mark_rate_limited(multiplier: int = 1) -> None:
     _rate_limited_until = time.time() + CHART_COOLDOWN_SECONDS * multiplier
 
 
+def is_rate_limited() -> bool:
+    """Expose rate-limit state so callers can surface status."""
+    return _is_rate_limited()
+
+
 def _log_warning(symbol: str, reason: str, source: str) -> None:
     key = (symbol, reason, source)
     if key in _WARNED:
@@ -81,9 +87,32 @@ def _fetch_yahoo(symbol: str) -> Dict:
         price = info.get("last_price") or info.get("last_price_usd") or info.get("previous_close")
         market_cap = info.get("market_cap")
         pe_ratio = info.get("pe_ratio") or info.get("trailing_pe")
+        volume = info.get("last_volume") or info.get("volume") or 0.0
+
+        needs_fallback = price is None or market_cap is None or not volume
+        if needs_fallback:
+            try:
+                detailed = ticker.get_info()
+            except HTTPError as exc:
+                if getattr(exc.response, "status_code", None) == 429:
+                    _mark_rate_limited()
+                raise DataFetchError(f"HTTP error: {exc}") from exc
+            except Exception as exc:
+                message = str(exc)
+                if "Too Many Requests" in message or "429" in message:
+                    _mark_rate_limited()
+                detailed = {}
+
+            if detailed:
+                price = price or detailed.get("regularMarketPrice") or detailed.get("previousClose")
+                market_cap = market_cap or detailed.get("marketCap")
+                volume = volume or detailed.get("regularMarketVolume") or detailed.get("volume") or 0.0
+                if pe_ratio is None:
+                    pe_ratio = detailed.get("trailingPE") or detailed.get("forwardPE")
+
         if price is None or market_cap is None:
             raise DataFetchError("Incomplete Yahoo fundamentals")
-        volume = info.get("last_volume") or info.get("volume") or 0.0
+
         return {
             "symbol": symbol,
             "price": float(price),
@@ -185,6 +214,60 @@ def _fetch_stockdata(symbol: str) -> Optional[Dict]:
         return None
 
 
+def _fetch_yahoo_quote(symbol: str) -> Optional[Dict]:
+    try:
+        resp = SESSION.get(
+            YAHOO_QUOTE_URL,
+            params={"symbols": symbol},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("quoteResponse", {}).get("result", [])
+        if not results:
+            return None
+        quote = results[0]
+        price = quote.get("regularMarketPrice") or quote.get("regularMarketPreviousClose")
+        market_cap = quote.get("marketCap")
+        volume = quote.get("regularMarketVolume") or quote.get("averageDailyVolume10Day") or 0.0
+        pe_ratio = quote.get("trailingPE") or quote.get("forwardPE")
+        if price is None or market_cap is None:
+            return None
+        return {
+            "symbol": symbol,
+            "price": float(price),
+            "market_cap": float(market_cap),
+            "pe_ratio": float(pe_ratio) if pe_ratio else None,
+            "volume": float(volume),
+            "source": "yahoo_quote",
+        }
+    except RequestException as exc:
+        _log_warning(symbol, f"yahoo_quote_error:{exc}", "yahoo_quote")
+        return None
+
+
+def _download_yfinance(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """Return price history from yfinance; raise DataFetchError when unavailable."""
+    if _is_rate_limited():
+        raise DataFetchError("Yahoo temporarily rate limited")
+
+    try:
+        df = yf.download(
+            symbol,
+            interval=interval,
+            period=period,
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty:
+            raise DataFetchError("Empty price history")
+        return df
+    except Exception as exc:
+        message = str(exc)
+        if "429" in message or "Too Many Requests" in message:
+            _mark_rate_limited()
+        raise DataFetchError(message)
+
+
 def fetch_fundamentals(symbol: str) -> Optional[Dict]:
     cached = _FUNDAMENTAL_CACHE.get(symbol)
     if cached and time.time() - cached["timestamp"] < _CACHE_TTL_SECONDS:
@@ -207,6 +290,11 @@ def fetch_fundamentals(symbol: str) -> Optional[Dict]:
     if stockdata:
         _FUNDAMENTAL_CACHE[symbol] = {"data": stockdata, "timestamp": time.time()}
         return stockdata
+
+    yahoo_quote = _fetch_yahoo_quote(symbol)
+    if yahoo_quote:
+        _FUNDAMENTAL_CACHE[symbol] = {"data": yahoo_quote, "timestamp": time.time()}
+        return yahoo_quote
 
     _log_warning(symbol, "missing fundamentals", "all")
     return None
